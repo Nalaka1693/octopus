@@ -1386,7 +1386,7 @@ bool allow_flank_scoring(const OptionMap& options)
     return options.at("inactive-flank-scoring").as<bool>() && !is_very_fast_mode(options);
 }
 
-auto make_indel_error_model(const OptionMap& options)
+std::unique_ptr<IndelErrorModel> make_indel_error_model(const OptionMap& options)
 {
     if (is_set("sequence-error-model", options)) {
         return octopus::make_indel_error_model(options.at("sequence-error-model").as<std::string>());
@@ -1395,12 +1395,16 @@ auto make_indel_error_model(const OptionMap& options)
     }
 }
 
-auto make_snv_error_model(const OptionMap& options)
+std::unique_ptr<SnvErrorModel> make_snv_error_model(const OptionMap& options)
 {
-    if (is_set("sequence-error-model", options)) {
-        return octopus::make_snv_error_model(options.at("sequence-error-model").as<std::string>());
+    if (options.at("model-runthrough-snvs").as<bool>()) {
+        if (is_set("sequence-error-model", options)) {
+            return octopus::make_snv_error_model(options.at("sequence-error-model").as<std::string>());
+        } else {
+            return octopus::make_snv_error_model();
+        }
     } else {
-        return octopus::make_snv_error_model();
+        return nullptr;
     }
 }
 

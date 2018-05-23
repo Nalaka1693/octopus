@@ -42,6 +42,7 @@ OutputIt count_runs(ForwardIt first, ForwardIt last, OutputIt result,
                               if (x == 0) {
                                   ++gap;
                                   if (count > 0) {
+                                      --count;
                                       if (gap == 1) {
                                           if (max_gap >= 1) {
                                               return count;

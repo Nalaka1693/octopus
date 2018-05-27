@@ -554,6 +554,65 @@ LocalReassembler::assemble_bin(const unsigned kmer_size, const Bin& bin, std::de
     }
 }
 
+struct Repeat : public Mappable<Repeat>
+{
+    ContigRegion region;
+    unsigned period;
+    Assembler::NucleotideSequence::const_iterator begin_itr, end_itr;
+    const auto& mapped_region() const noexcept { return region; }
+    auto begin() const noexcept { return begin_itr; }
+    auto end() const noexcept { return end_itr; }
+    Repeat() = default;
+    Repeat(const tandem::Repeat& repeat, const Assembler::NucleotideSequence& sequence) noexcept
+    : region {repeat.pos, repeat.pos + repeat.length}
+    , period {repeat.period}
+    , begin_itr {std::next(std::cbegin(sequence), repeat.pos)}
+    , end_itr {std::next(begin_itr, repeat.length)}
+    {}
+};
+
+struct VariantReference : public Mappable<VariantReference>
+{
+    using Position = ContigRegion::Position;
+    ContigRegion region;
+    std::reference_wrapper<Assembler::Variant> variant;
+    const auto& mapped_region() const noexcept { return region; }
+    VariantReference(Assembler::Variant& v)
+    : region {static_cast<Position>(v.begin_pos), static_cast<Position>(v.begin_pos + v.ref.size())}
+    , variant {v}
+    {}
+    const auto& ref() const noexcept { return variant.get().ref; }
+    auto& ref() noexcept { return variant.get().ref; }
+    const auto& alt() const noexcept { return variant.get().alt; }
+    auto& alt() noexcept { return variant.get().alt; }
+};
+
+struct ConstVariantReference : public Mappable<ConstVariantReference>
+{
+    using Position = ContigRegion::Position;
+    ContigRegion region;
+    std::reference_wrapper<const Assembler::Variant> variant;
+    const auto& mapped_region() const noexcept { return region; }
+    ConstVariantReference(const Assembler::Variant& v)
+    : region {static_cast<Position>(v.begin_pos), static_cast<Position>(v.begin_pos + v.ref.size())}
+    , variant {v}
+    {}
+    const auto& ref() const noexcept { return variant.get().ref; }
+    const auto& alt() const noexcept { return variant.get().alt; }
+};
+
+auto find_repeats(Assembler::NucleotideSequence& sequence, const unsigned max_period = 5)
+{
+    sequence.push_back('$');
+    auto repeats = tandem::extract_exact_tandem_repeats(sequence, 1, max_period);
+    sequence.pop_back();
+    std::vector<Repeat> result(repeats.size());
+    std::transform(std::cbegin(repeats), std::cend(repeats), std::begin(result),
+                   [&] (auto repeat) { return Repeat {repeat, sequence}; });
+    std::sort(std::begin(result), std::end(result));
+    return result;
+}
+
 bool is_inversion(const Assembler::Variant& v) noexcept
 {
     return v.ref.size() > 2
@@ -579,26 +638,45 @@ void trim_reference(std::deque<Assembler::Variant>& variants)
     for (auto& v : variants) trim_reference(v);
 }
 
+bool is_snv(const Assembler::Variant& v) noexcept
+{
+    return v.ref.size() == 1 && v.alt.size() == 1;
+}
+
 bool is_complex(const Assembler::Variant& v) noexcept
 {
     return (v.ref.size() > 1 && !v.alt.empty()) || (v.alt.size() > 1 && !v.ref.empty());
 }
 
-bool is_decomposable(const Assembler::Variant& v) noexcept
+bool is_homopolymer_snv(const ConstVariantReference& v, const std::vector<Repeat>& reference_repeats) noexcept
 {
-    return is_complex(v) && !is_inversion(v);
+    const auto overlapped_repeats = overlap_range(reference_repeats, v);
+    const auto boundary_itr = std::find_if(std::cbegin(overlapped_repeats), std::cend(overlapped_repeats),
+    [&v] (const auto& repeat) { return (begins_equal(v, repeat) || ends_equal(v, repeat)) && repeat.period == 1; });
+    return boundary_itr != std::cend(overlapped_repeats);
 }
 
-auto partition_decomposable(std::deque<Assembler::Variant>& variants)
+bool is_snv_between_distinct_repeats(const Assembler::Variant& v, const std::vector<Repeat>& reference_repeats) noexcept
+{
+    return is_snv(v) && is_homopolymer_snv(ConstVariantReference {v}, reference_repeats);
+}
+
+bool is_decomposable(const Assembler::Variant& v, const std::vector<Repeat>& reference_repeats) noexcept
+{
+    return (is_complex(v) && !is_inversion(v)) || is_snv_between_distinct_repeats(v, reference_repeats);
+}
+
+auto partition_decomposable(std::deque<Assembler::Variant>& variants, const std::vector<Repeat>& reference_repeats)
 {
     return std::stable_partition(std::begin(variants), std::end(variants),
-                                 [] (const auto& candidate) { return !is_decomposable(candidate); });
+                                 [&] (const auto& candidate) { return !is_decomposable(candidate, reference_repeats); });
 }
 
 bool is_mnv(const Assembler::Variant& v) noexcept
 {
     return v.ref.size() == v.alt.size()
-           && (v.ref.size() <= 2
+           && v.ref.size() > 1
+           && (v.ref.size() == 2
                || std::equal(std::next(std::cbegin(v.ref)), std::prev(std::cend(v.ref)), std::next(std::cbegin(v.alt))));
 }
 
@@ -628,50 +706,18 @@ auto split_mnv(Assembler::Variant&& mnv)
     return result;
 }
 
-struct Repeat : public Mappable<Repeat>
+auto find_splittable_reference_repeat(const VariantReference& v, const std::vector<Repeat>& ref_repeats)
 {
-    ContigRegion region;
-    unsigned period;
-    Assembler::NucleotideSequence::const_iterator begin_itr, end_itr;
-    const auto& mapped_region() const noexcept { return region; }
-    auto begin() const noexcept { return begin_itr; }
-    auto end() const noexcept { return end_itr; }
-    Repeat() = default;
-    Repeat(const tandem::Repeat& repeat, const Assembler::NucleotideSequence& sequence) noexcept
-    : region {repeat.pos, repeat.pos + repeat.length}
-    , period {repeat.period}
-    , begin_itr {std::next(std::cbegin(sequence), repeat.pos)}
-    , end_itr {std::next(begin_itr, repeat.length)}
-    {}
-};
-
-auto find_repeats(Assembler::NucleotideSequence& sequence, const unsigned max_period = 5)
-{
-    sequence.push_back('$');
-    auto repeats = tandem::extract_exact_tandem_repeats(sequence, 1, max_period);
-    sequence.pop_back();
-    std::vector<Repeat> result(repeats.size());
-    std::transform(std::cbegin(repeats), std::cend(repeats), std::begin(result),
-                   [&] (auto repeat) { return Repeat {repeat, sequence}; });
-    std::sort(std::begin(result), std::end(result));
-    return result;
+    const auto ref_repeat_itr = max_overlapped(ref_repeats, v);
+    if (ref_repeat_itr == std::cend(ref_repeats)) return std::cend(ref_repeats);
+    const auto& ref_repeat = *ref_repeat_itr;
+    if (!contains(ref_repeat, v)) return std::cend(ref_repeats);
+    if (ref_repeat.period == 1 && utils::is_homopolymer(v.ref()) && utils::is_homopolymer(v.alt())) {
+        return ref_repeat_itr;
+    }
+    if (v.ref().size() < 2 * ref_repeat.period) return std::cend(ref_repeats);
+    return ref_repeat_itr;
 }
-
-struct VariantReference : public Mappable<VariantReference>
-{
-    using Position = ContigRegion::Position;
-    ContigRegion region;
-    std::reference_wrapper<Assembler::Variant> variant;
-    const auto& mapped_region() const noexcept { return region; }
-    VariantReference(Assembler::Variant& v)
-    : region {static_cast<Position>(v.begin_pos), static_cast<Position>(v.begin_pos + v.ref.size())}
-    , variant {v}
-    {}
-    const auto& ref() const noexcept { return variant.get().ref; }
-    auto& ref() noexcept { return variant.get().ref; }
-    const auto& alt() const noexcept { return variant.get().alt; }
-    auto& alt() noexcept { return variant.get().alt; }
-};
 
 bool matches_rhs(const Repeat& repeat, const Assembler::NucleotideSequence& sequence) noexcept
 {
@@ -697,7 +743,7 @@ auto rotate_right(Range& range, std::size_t n)
 
 void complete_partial_ref_repeat(Assembler::Variant& v, const Repeat& repeat)
 {
-    assert(v.ref.size() > repeat.period);
+    assert(v.ref.size() >= repeat.period);
     const auto partial_repeat_len = v.ref.size() % repeat.period;
     if (partial_repeat_len > 0) {
         const auto num_remaining_repeat_bases = repeat.period - partial_repeat_len;
@@ -715,7 +761,7 @@ void complete_partial_ref_repeat(Assembler::Variant& v, const Repeat& repeat)
 
 void complete_partial_alt_repeat(Assembler::Variant& v, const Repeat& repeat)
 {
-    assert(v.alt.size() > repeat.period);
+    assert(v.alt.size() >= repeat.period);
     const auto partial_repeat_len = v.alt.size() % repeat.period;
     if (partial_repeat_len > 0) {
         const auto num_remaining_repeat_bases = repeat.period - partial_repeat_len;
@@ -730,13 +776,12 @@ void complete_partial_alt_repeat(Assembler::Variant& v, const Repeat& repeat)
 
 std::vector<Assembler::Variant> try_to_split_repeats(Assembler::Variant& v, const std::vector<Repeat>& ref_repeats)
 {
-    VariantReference v_ref {v};
-    const auto ref_repeat_itr = max_overlapped(ref_repeats, v_ref);
+    const VariantReference v_ref {v};
+    const auto ref_repeat_itr = find_splittable_reference_repeat(v_ref, ref_repeats);
     if (ref_repeat_itr == std::cend(ref_repeats)) return {};
     const auto& ref_repeat = *ref_repeat_itr;
-    if (!contains(ref_repeat, v_ref)) return {};
-    if (v.ref.size() < 2 * ref_repeat.period) return {};
     const auto ref_repeat_is_lhs = left_overhang_size(ref_repeat, v_ref) > ref_repeat.period;
+    auto alt_repeat_itr = std::cend(ref_repeats);
     if (ref_repeat_is_lhs) {
         if (ends_before(ref_repeat, v_ref)) return {};
         complete_partial_ref_repeat(v, ref_repeat);
@@ -744,15 +789,23 @@ std::vector<Assembler::Variant> try_to_split_repeats(Assembler::Variant& v, cons
         auto alt_repeat_ritr = std::make_reverse_iterator(ref_repeat_itr);
         auto alt_repeat_match_ritr = std::crend(ref_repeats);
         for (; alt_repeat_ritr != std::crend(ref_repeats); ++alt_repeat_ritr) {
-            if (is_before(*alt_repeat_ritr, ref_repeat)) break;
             if (matches_rhs(*alt_repeat_ritr, v.alt)) alt_repeat_match_ritr = alt_repeat_ritr;
+            if (is_before(*alt_repeat_ritr, ref_repeat)) break;
         }
         if (alt_repeat_match_ritr == std::crend(ref_repeats)) return {};
         if (v.alt.size() < alt_repeat_match_ritr->period) return {};
         complete_partial_alt_repeat(v, *alt_repeat_match_ritr);
+        alt_repeat_itr = alt_repeat_match_ritr.base();
     }
     Assembler::Variant deletion {v.begin_pos, std::move(v.ref), ""}, insertion {v.begin_pos, "", std::move(v.alt)};
-    if (ref_repeat_is_lhs) insertion.begin_pos += deletion.ref.size();
+    if (ref_repeat_is_lhs) {
+        insertion.begin_pos += deletion.ref.size();
+        if (ref_repeat.period == 1) {
+            deletion.begin_pos = mapped_begin(ref_repeat);
+        }
+    } else if (alt_repeat_itr->period == 1) {
+        insertion.begin_pos = mapped_begin(*alt_repeat_itr);
+    }
     return {std::move(deletion), std::move(insertion)};
 }
 
@@ -936,7 +989,7 @@ void decompose(std::deque<Assembler::Variant>& variants, const ReferenceGenome::
 {
     auto tmp = reference;
     auto reference_repeats = find_repeats(tmp);
-    const auto first_decomposable = partition_decomposable(variants);
+    const auto first_decomposable = partition_decomposable(variants, reference_repeats);
     if (first_decomposable != std::end(variants)) {
         merge(decompose(first_decomposable, std::end(variants), reference_repeats), variants, first_decomposable);
     }

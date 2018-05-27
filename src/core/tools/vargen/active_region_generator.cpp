@@ -74,10 +74,39 @@ auto find_compound_microsatellites(const std::vector<TandemRepeat>& repeats, con
     return join(find_repeat_regions(repeats, region, compound_microsatellite_def), max_read_length / 2);
 }
 
+auto find_adjacent_homopolymer_regions(const std::vector<TandemRepeat>& homopolymers)
+{
+    std::vector<GenomicRegion> blocks {};
+    blocks.reserve(homopolymers.size());
+    for (auto lhs_itr = std::cbegin(homopolymers), rhs_itr = std::next(lhs_itr); rhs_itr != std::cend(homopolymers); ++lhs_itr, ++rhs_itr) {
+        if (are_adjacent(*lhs_itr, *rhs_itr)) blocks.push_back(encompassing_region(*lhs_itr, *rhs_itr));
+    }
+    return extract_covered_regions(blocks);
+}
+
+auto find_adjacent_homopolymer_regions(const ReferenceGenome& reference, const GenomicRegion& region,
+                                       const unsigned min_repeat_len)
+{
+    auto homopolymers = find_exact_tandem_repeats(reference, region, 1);
+    homopolymers.erase(std::remove_if(std::begin(homopolymers), std::end(homopolymers),
+                                      [=] (const auto& homopolymer) { return region_size(homopolymer) >= min_repeat_len; }),
+                                      std::end(homopolymers));
+    return find_adjacent_homopolymer_regions(homopolymers);
+}
+
+auto merged_covered_regions(std::vector<GenomicRegion> lhs, std::vector<GenomicRegion> rhs)
+{
+    auto itr = utils::append(std::move(rhs), lhs);
+    std::inplace_merge(std::begin(lhs), itr, std::end(lhs));
+    return extract_covered_regions(lhs);
+}
+
 std::vector<GenomicRegion> ActiveRegionGenerator::generate(const GenomicRegion& region, const std::string& generator) const
 {
     if (is_assembler(generator) && assembler_active_region_generator_) {
-        return assembler_active_region_generator_->generate(region);
+        auto default_assembler_regions = assembler_active_region_generator_->generate(region);
+        auto homopolymer_regions = find_adjacent_homopolymer_regions(reference_, region, 4);
+        return merged_covered_regions(std::move(default_assembler_regions), std::move(homopolymer_regions));
     } else {
         return {region};
     }
